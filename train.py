@@ -12,20 +12,21 @@ sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, 'models'))
 sys.path.append(os.path.join(BASE_DIR, 'utils'))
 import provider
-import tf_util
+import utils.tf_util
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', type=int, default=0, help='GPU to use [default: GPU 0]')
 parser.add_argument('--model', default='pointnet_cls', help='Model name: pointnet_cls or pointnet_cls_basic [default: pointnet_cls]')
 parser.add_argument('--log_dir', default='log', help='Log dir [default: log]')
 parser.add_argument('--num_point', type=int, default=1024, help='Point Number [256/512/1024/2048] [default: 1024]')
-parser.add_argument('--max_epoch', type=int, default=250, help='Epoch to run [default: 250]')
-parser.add_argument('--batch_size', type=int, default=32, help='Batch Size during training [default: 32]')
+parser.add_argument('--max_epoch', type=int, default=200, help='Epoch to run [default: 250]')
+parser.add_argument('--batch_size', type=int, default=16, help='Batch Size during training [default: 32]')
 parser.add_argument('--learning_rate', type=float, default=0.001, help='Initial learning rate [default: 0.001]')
 parser.add_argument('--momentum', type=float, default=0.9, help='Initial learning rate [default: 0.9]')
 parser.add_argument('--optimizer', default='adam', help='adam or momentum [default: adam]')
 parser.add_argument('--decay_step', type=int, default=200000, help='Decay step for lr decay [default: 200000]')
 parser.add_argument('--decay_rate', type=float, default=0.7, help='Decay rate for lr decay [default: 0.8]')
+parser.add_argument('--sample_list', type=str, default=None, help='data path of .npy to train')
 FLAGS = parser.parse_args()
 
 
@@ -63,6 +64,52 @@ TRAIN_FILES = provider.getDataFiles( \
     os.path.join(BASE_DIR, 'data/modelnet40_ply_hdf5_2048/train_files.txt'))
 TEST_FILES = provider.getDataFiles(\
     os.path.join(BASE_DIR, 'data/modelnet40_ply_hdf5_2048/test_files.txt'))
+
+total_data = []
+total_labels = []
+for idx in range(len(TRAIN_FILES)):
+    f = h5py.File(TRAIN_FILES[idx], "r")
+    data = f['data'][:]
+    label = f['label'][:]
+    current_data, current_label = data[:,0:NUM_POINT,:], label
+    total_data.append(current_data)
+    total_labels.append(current_label)
+
+total_data = np.concatenate(total_data, axis=0)
+total_labels = np.squeeze(np.concatenate(total_labels, axis=0))
+total_data = total_data.astype(np.float32)
+total_labels = total_labels.astype(np.int32)
+
+total_test_data = []
+total_test_labels = []
+for idx in range(len(TEST_FILES)):
+    f = h5py.File(TEST_FILES[idx], "r")
+    data = f['data'][:]
+    label = f['label'][:]
+    current_data, current_label = data[:,0:NUM_POINT,:], label
+    total_test_data.append(current_data)
+    total_test_labels.append(current_label)
+
+TEST_DATA = np.concatenate(total_test_data, axis=0)
+TEST_LABELS = np.squeeze(np.concatenate(total_test_labels, axis=0))
+TEST_DATA = TEST_DATA.astype(np.float32)
+TEST_LABELS = TEST_LABELS.astype(np.int32)
+
+print("===============")
+print("#test data: {}".format(TEST_DATA.shape[0]))
+print("===============")
+
+if FLAGS.sample_list is not None:
+    sample_list = np.load(FLAGS.sample_list)
+    CURR_DATA = total_data[sample_list, :, :]
+    CURR_LABELS = total_labels[sample_list]
+
+    print("=========================")
+    print("#{} sample to be trained... ".format(len(sample_list)))
+    print("=========================")
+else:
+    CURR_DATA, CURR_LABELS = total_data, total_labels
+
 
 def log_string(out_str):
     LOG_FOUT.write(out_str+'\n')
@@ -154,66 +201,79 @@ def train():
                'merged': merged,
                'step': batch}
 
+        max_test_accu = float("-inf")
+
         for epoch in range(MAX_EPOCH):
             log_string('**** EPOCH %03d ****' % (epoch))
             sys.stdout.flush()
              
-            train_one_epoch(sess, ops, train_writer)
-            eval_one_epoch(sess, ops, test_writer)
+            train_one_epoch(CURR_DATA, CURR_LABELS, sess, ops, train_writer)
+            curr_accu = eval_one_epoch(TEST_DATA, TEST_LABELS, sess, ops, test_writer)
+
+            if max_test_accu < curr_accu:
+                max_test_accu = curr_accu
+                max_train_epoch = epoch
+                saver.save(sess, os.path.join(LOG_DIR, "model_train_best.ckpt"))
             
             # Save the variables to disk.
             if epoch % 10 == 0:
-                save_path = saver.save(sess, os.path.join(LOG_DIR, "model.ckpt"))
+                save_path = saver.save(sess, os.path.join(LOG_DIR, "model_epoch_{}.ckpt".format(epoch)))
                 log_string("Model saved in file: %s" % save_path)
 
+        print("Max test accuracy: {:.4f}".format(max_test_accu))
+        print("The train epoch is {}".format(max_train_epoch))
 
 
-def train_one_epoch(sess, ops, train_writer):
+def train_one_epoch(CURR_DATA, CURR_LABELS, sess, ops, train_writer):
     """ ops: dict mapping from string to tf ops """
     is_training = True
     
     # Shuffle train files
-    train_file_idxs = np.arange(0, len(TRAIN_FILES))
-    np.random.shuffle(train_file_idxs)
-    
-    for fn in range(len(TRAIN_FILES)):
-        log_string('----' + str(fn) + '-----')
-        current_data, current_label = provider.loadDataFile(TRAIN_FILES[train_file_idxs[fn]])
-        current_data = current_data[:,0:NUM_POINT,:]
-        current_data, current_label, _ = provider.shuffle_data(current_data, np.squeeze(current_label))            
-        current_label = np.squeeze(current_label)
+    # train_file_idxs = np.arange(0, len(TRAIN_FILES))
+    # np.random.shuffle(train_file_idxs)
+
+    train_files_idx = np.arange(0, CURR_DATA.shape[0])
+    np.random.shuffle(train_files_idx)
+
+    CURR_DATA, CURR_LABELS = CURR_DATA[train_files_idx,:,:], CURR_LABELS[train_files_idx]
+    # for fn in range(len(TRAIN_FILES)):
+    #     log_string('----' + str(fn) + '-----')
+    #     current_data, current_label = provider.loadDataFile(TRAIN_FILES[train_file_idxs[fn]])
+    #     current_data = current_data[:,0:NUM_POINT,:]
+    #     current_data, current_label, _ = provider.shuffle_data(current_data, np.squeeze(current_label))
+    #     current_label = np.squeeze(current_label)
         
-        file_size = current_data.shape[0]
-        num_batches = file_size // BATCH_SIZE
+    file_size = CURR_DATA.shape[0]
+    num_batches = file_size // BATCH_SIZE
+
+    total_correct = 0
+    total_seen = 0
+    loss_sum = 0
+
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = (batch_idx+1) * BATCH_SIZE
+
+        # Augment batched point clouds by rotation and jittering
+        rotated_data = provider.rotate_point_cloud(CURR_DATA[start_idx:end_idx, :, :])
+        jittered_data = provider.jitter_point_cloud(rotated_data)
+        feed_dict = {ops['pointclouds_pl']: jittered_data,
+                     ops['labels_pl']: CURR_LABELS[start_idx:end_idx],
+                     ops['is_training_pl']: is_training,}
+        summary, step, _, loss_val, pred_val = sess.run([ops['merged'], ops['step'],
+            ops['train_op'], ops['loss'], ops['pred']], feed_dict=feed_dict)
+        train_writer.add_summary(summary, step)
+        pred_val = np.argmax(pred_val, 1)
+        correct = np.sum(pred_val == CURR_LABELS[start_idx:end_idx])
+        total_correct += correct
+        total_seen += BATCH_SIZE
+        loss_sum += loss_val
         
-        total_correct = 0
-        total_seen = 0
-        loss_sum = 0
-       
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * BATCH_SIZE
-            end_idx = (batch_idx+1) * BATCH_SIZE
-            
-            # Augment batched point clouds by rotation and jittering
-            rotated_data = provider.rotate_point_cloud(current_data[start_idx:end_idx, :, :])
-            jittered_data = provider.jitter_point_cloud(rotated_data)
-            feed_dict = {ops['pointclouds_pl']: jittered_data,
-                         ops['labels_pl']: current_label[start_idx:end_idx],
-                         ops['is_training_pl']: is_training,}
-            summary, step, _, loss_val, pred_val = sess.run([ops['merged'], ops['step'],
-                ops['train_op'], ops['loss'], ops['pred']], feed_dict=feed_dict)
-            train_writer.add_summary(summary, step)
-            pred_val = np.argmax(pred_val, 1)
-            correct = np.sum(pred_val == current_label[start_idx:end_idx])
-            total_correct += correct
-            total_seen += BATCH_SIZE
-            loss_sum += loss_val
-        
-        log_string('mean loss: %f' % (loss_sum / float(num_batches)))
-        log_string('accuracy: %f' % (total_correct / float(total_seen)))
+    log_string('mean loss: %f' % (loss_sum / float(num_batches)))
+    log_string('accuracy: %f' % (total_correct / float(total_seen)))
 
         
-def eval_one_epoch(sess, ops, test_writer):
+def eval_one_epoch(TEST_DATA, TEST_LABELS, sess, ops, test_writer):
     """ ops: dict mapping from string to tf ops """
     is_training = False
     total_correct = 0
@@ -222,38 +282,39 @@ def eval_one_epoch(sess, ops, test_writer):
     total_seen_class = [0 for _ in range(NUM_CLASSES)]
     total_correct_class = [0 for _ in range(NUM_CLASSES)]
     
-    for fn in range(len(TEST_FILES)):
-        log_string('----' + str(fn) + '-----')
-        current_data, current_label = provider.loadDataFile(TEST_FILES[fn])
-        current_data = current_data[:,0:NUM_POINT,:]
-        current_label = np.squeeze(current_label)
-        
-        file_size = current_data.shape[0]
-        num_batches = file_size // BATCH_SIZE
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * BATCH_SIZE
-            end_idx = (batch_idx+1) * BATCH_SIZE
+    # for fn in range(len(TEST_FILES)):
+    #     log_string('----' + str(fn) + '-----')
+    # current_data, current_label = provider.loadDataFile(TEST_FILES[fn])
+    # current_data = current_data[:,0:NUM_POINT,:]
+    # current_label = np.squeeze(current_label)
 
-            feed_dict = {ops['pointclouds_pl']: current_data[start_idx:end_idx, :, :],
-                         ops['labels_pl']: current_label[start_idx:end_idx],
-                         ops['is_training_pl']: is_training}
-            summary, step, loss_val, pred_val = sess.run([ops['merged'], ops['step'],
-                ops['loss'], ops['pred']], feed_dict=feed_dict)
-            pred_val = np.argmax(pred_val, 1)
-            correct = np.sum(pred_val == current_label[start_idx:end_idx])
-            total_correct += correct
-            total_seen += BATCH_SIZE
-            loss_sum += (loss_val*BATCH_SIZE)
-            for i in range(start_idx, end_idx):
-                l = current_label[i]
-                total_seen_class[l] += 1
-                total_correct_class[l] += (pred_val[i-start_idx] == l)
+    file_size = TEST_DATA.shape[0]
+    num_batches = file_size // BATCH_SIZE
+
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = (batch_idx+1) * BATCH_SIZE
+
+        feed_dict = {ops['pointclouds_pl']: TEST_DATA[start_idx:end_idx, :, :],
+                     ops['labels_pl']: TEST_LABELS[start_idx:end_idx],
+                     ops['is_training_pl']: is_training}
+        summary, step, loss_val, pred_val = sess.run([ops['merged'], ops['step'],
+            ops['loss'], ops['pred']], feed_dict=feed_dict)
+        pred_val = np.argmax(pred_val, 1)
+        correct = np.sum(pred_val == TEST_LABELS[start_idx:end_idx])
+        total_correct += correct
+        total_seen += BATCH_SIZE
+        loss_sum += (loss_val*BATCH_SIZE)
+        for i in range(start_idx, end_idx):
+            l = TEST_LABELS[i]
+            total_seen_class[l] += 1
+            total_correct_class[l] += (pred_val[i-start_idx] == l)
             
     log_string('eval mean loss: %f' % (loss_sum / float(total_seen)))
     log_string('eval accuracy: %f'% (total_correct / float(total_seen)))
     log_string('eval avg class acc: %f' % (np.mean(np.array(total_correct_class)/np.array(total_seen_class,dtype=np.float))))
-         
+
+    return total_correct / float(total_seen)
 
 
 if __name__ == "__main__":
